@@ -1,0 +1,1277 @@
+//
+//  KeyTypeTests.swift
+//  KeyTypeTests
+//
+//  Created by John Bean on 5/29/26.
+//
+
+import AutocompleteCore
+import AppCompatibility
+import AppKit
+import ConstrainedGeneration
+import CompletionUI
+import MacContextCapture
+import ModelRuntime
+import Testing
+import TokenProfiles
+@testable import KeyType
+
+private actor AsyncTestGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+
+    func hasOpened() -> Bool {
+        isOpen
+    }
+}
+
+private actor ShutdownTrackingRuntime: LocalModelRuntime {
+    nonisolated let metadata = ModelMetadata(
+        identifier: "shutdown-tracking",
+        family: "stub",
+        vocabularySize: 256,
+        contextLength: 4096
+    )
+    nonisolated let tokenizer: ModelTokenizing = UTF8FallbackTokenizer()
+    private var shutdownCallCount = 0
+
+    func prepare(promptTokens: [TokenID]) async throws {}
+    func logitsForNextToken() async throws -> [TokenLogit] { [] }
+    func decodeNext(tokenID: TokenID) async throws {}
+    func resetKVCache() async {}
+    func shutdown() async { shutdownCallCount += 1 }
+
+    func observedShutdownCallCount() -> Int {
+        shutdownCallCount
+    }
+}
+
+struct KeyTypeTests {
+    private static let target = AppTarget(bundleIdentifier: "com.test.app", appName: "Test")
+
+    private static func temporaryDefaults() -> (UserDefaults, String) {
+        let suiteName = "KeyTypeTests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            fatalError("Unable to create temporary defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        return (defaults, suiteName)
+    }
+
+    private static func promotionCache(
+        candidates: [String],
+        beforeCursor: String = "I will ",
+        minimumRemainingCharacters: Int = CompletionPromotionCache.defaultMinimumRemainingCharacters
+    ) -> CompletionPromotionCache {
+        CompletionPromotionCache(
+            anchorContext: TextFieldContext(beforeCursor: beforeCursor, target: target),
+            entries: candidates.enumerated().map { index, text in
+                CompletionPromotionCache.Entry(anchorText: text, sourceRank: index)
+            },
+            minimumRemainingCharacters: minimumRemainingCharacters
+        )
+    }
+
+    private static func candidateTexts(prefix: String, count: Int) -> [String] {
+        (0..<count).map { "\(prefix) branch \($0) continuation" }
+    }
+
+    private static func liveContext(
+        typed typedSinceAnchor: String,
+        beforeCursor: String = "I will "
+    ) -> TextFieldContext {
+        TextFieldContext(beforeCursor: beforeCursor + typedSinceAnchor, target: target)
+    }
+
+    @Test func fontResolverPrefersVisibleFamilyWhenAXPostScriptNameDisagrees() {
+        #expect(FieldFontResolver.fontNameCandidates(
+            name: "Helvetica",
+            family: "Aptos",
+            visibleName: "Aptos"
+        ) == ["Aptos", "Helvetica"])
+    }
+
+    @Test func fontResolverKeepsMatchingPostScriptStyleFirst() {
+        #expect(FieldFontResolver.fontNameCandidates(
+            name: "Helvetica-Bold",
+            family: "Helvetica",
+            visibleName: "Helvetica Bold"
+        ).first == "Helvetica-Bold")
+    }
+
+    @Test func adaptiveDebounceUsesFastPathAfterResponsiveGeneration() {
+        #expect(CompletionController.adaptiveDebounceNanoseconds(lastGenerationLatencyMs: 35) == 15_000_000)
+    }
+
+    @Test func adaptiveDebounceKeepsConservativeDelayAfterSlowGeneration() {
+        #expect(CompletionController.adaptiveDebounceNanoseconds(lastGenerationLatencyMs: 180) == 55_000_000)
+    }
+
+    @Test func adaptiveDebounceStartsAtModerateDelayBeforeTelemetry() {
+        #expect(CompletionController.adaptiveDebounceNanoseconds(lastGenerationLatencyMs: nil) == 25_000_000)
+    }
+
+    @Test @MainActor func taskRegistryRetainsCancelledWorkUntilDrainCompletes() async {
+        let registry = CompletionTaskRegistry()
+        let started = AsyncTestGate()
+        let cancellationObserved = AsyncTestGate()
+        let release = AsyncTestGate()
+        let drainFinished = AsyncTestGate()
+
+        let handle = registry.start {
+            await started.open()
+            while !Task.isCancelled {
+                await Task.yield()
+            }
+            await cancellationObserved.open()
+            // Deliberately ignore cancellation, like a Metal command-buffer wait does.
+            await release.wait()
+        }
+
+        await started.wait()
+        handle?.cancel()
+        await cancellationObserved.wait()
+        #expect(registry.activeTaskCount == 1)
+
+        let drain = Task { @MainActor in
+            await registry.closeAndWait()
+            await drainFinished.open()
+        }
+        await Task.yield()
+        #expect(!(await drainFinished.hasOpened()))
+
+        await release.open()
+        await drain.value
+        #expect(await drainFinished.hasOpened())
+        #expect(registry.activeTaskCount == 0)
+        #expect(registry.isClosed)
+        #expect(registry.start {} == nil)
+    }
+
+    @Test @MainActor func shutdownWaitsForLateModelLoadAndDisposesItsEngine() async {
+        let (defaults, suiteName) = Self.temporaryDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let builderStarted = AsyncTestGate()
+        let cancellationObserved = AsyncTestGate()
+        let allowBuilderToReturn = AsyncTestGate()
+        let shutdownFinished = AsyncTestGate()
+        let runtime = ShutdownTrackingRuntime()
+        let loadedEngine = ConstrainedGenerationEngine(
+            runtime: runtime,
+            profile: InMemoryAutocompleteProfile(vocabularySize: 256)
+        )
+        let controller = CompletionController(
+            tracker: AccessibilityContextTracker(),
+            settings: SettingsStore(defaults: defaults),
+            engineBuilder: { _, _, _ in
+                await builderStarted.open()
+                while !Task.isCancelled {
+                    await Task.yield()
+                }
+                await cancellationObserved.open()
+                // Model construction is intentionally cancellation-resistant in this regression
+                // test, matching llama.cpp initialization already underway on another executor.
+                await allowBuilderToReturn.wait()
+                return loadedEngine
+            }
+        )
+
+        controller.loadIfNeeded()
+        await builderStarted.wait()
+        let shutdown = Task { @MainActor in
+            await controller.shutdown()
+            await shutdownFinished.open()
+        }
+
+        await cancellationObserved.wait()
+        #expect(!(await shutdownFinished.hasOpened()))
+        await allowBuilderToReturn.open()
+        await shutdown.value
+
+        #expect(await shutdownFinished.hasOpened())
+        #expect(await runtime.observedShutdownCallCount() == 1)
+        #expect(controller.loadState == .idle)
+    }
+
+    @Test func midLineBudgetUsesTwoVisibleTokensPlusLookahead() {
+        let context = TextFieldContext(
+            beforeCursor: "Please review",
+            afterCursor: " this change",
+            geometry: TextFieldGeometry(isAtEndOfLine: false),
+            target: Self.target
+        )
+
+        #expect(CompletionController.contextAwareCompletionTokenBudget(
+            baseMaxCompletionTokens: 8,
+            healExtraTokens: 0,
+            context: context
+        ) == 3)
+    }
+
+    @Test func healedMidLineBudgetKeepsOneTokenOfPrefixSlack() {
+        let context = TextFieldContext(
+            beforeCursor: "Please revi",
+            afterCursor: " this change",
+            geometry: TextFieldGeometry(isAtEndOfLine: false),
+            target: Self.target
+        )
+
+        #expect(CompletionController.contextAwareCompletionTokenBudget(
+            baseMaxCompletionTokens: 8,
+            healExtraTokens: 1,
+            context: context
+        ) == 4)
+    }
+
+    @Test func endOfLineBudgetRetainsConfiguredLengthAndHealingSlack() {
+        let context = TextFieldContext(
+            beforeCursor: "Please review",
+            afterCursor: "\nNext paragraph",
+            geometry: TextFieldGeometry(isAtEndOfLine: true),
+            target: Self.target
+        )
+
+        #expect(CompletionController.contextAwareCompletionTokenBudget(
+            baseMaxCompletionTokens: 8,
+            healExtraTokens: 1,
+            context: context
+        ) == 9)
+    }
+
+    @Test func defaultMediumLengthUsesFourTokenBudget() {
+        #expect(CompletionLength.medium.maxCompletionTokens == 4)
+        #expect(CompletionLength.medium.maxDisplayWidth == 60)
+    }
+
+    @Test func explicitLongLengthRetainsExtendedBudget() {
+        #expect(CompletionLength.long.maxCompletionTokens == 16)
+    }
+
+    @Test func burstAwareBudgetCapsCancellationProneLongRequest() {
+        #expect(CompletionController.burstAwareCompletionTokenBudget(
+            requestedMaxCompletionTokens: 16,
+            healExtraTokens: 0,
+            elapsedSincePreviousRequestNanoseconds: 20_000_000,
+            debounceNanoseconds: 25_000_000,
+            lastGenerationLatencyMs: 75
+        ) == 4)
+    }
+
+    @Test func burstAwareBudgetPreservesHealingSlack() {
+        #expect(CompletionController.burstAwareCompletionTokenBudget(
+            requestedMaxCompletionTokens: 17,
+            healExtraTokens: 1,
+            elapsedSincePreviousRequestNanoseconds: 20_000_000,
+            debounceNanoseconds: 25_000_000,
+            lastGenerationLatencyMs: 75
+        ) == 5)
+    }
+
+    @Test func burstAwareBudgetKeepsLongRequestAfterStableInterval() {
+        #expect(CompletionController.burstAwareCompletionTokenBudget(
+            requestedMaxCompletionTokens: 16,
+            healExtraTokens: 0,
+            elapsedSincePreviousRequestNanoseconds: 100_000_000,
+            debounceNanoseconds: 25_000_000,
+            lastGenerationLatencyMs: 75
+        ) == 16)
+    }
+
+    @Test func burstAwareBudgetNeverDelaysFirstOrDefaultRequest() {
+        #expect(CompletionController.burstAwareCompletionTokenBudget(
+            requestedMaxCompletionTokens: 16,
+            healExtraTokens: 0,
+            elapsedSincePreviousRequestNanoseconds: nil,
+            debounceNanoseconds: 25_000_000,
+            lastGenerationLatencyMs: 75
+        ) == 16)
+        #expect(CompletionController.burstAwareCompletionTokenBudget(
+            requestedMaxCompletionTokens: 4,
+            healExtraTokens: 0,
+            elapsedSincePreviousRequestNanoseconds: 10_000_000,
+            debounceNanoseconds: 55_000_000,
+            lastGenerationLatencyMs: 180
+        ) == 4)
+    }
+
+    @Test func spellingLanguageRefinesBareTagWithPreferredInstalledVariant() {
+        #expect(SpellingLanguage.resolve(
+            "en",
+            availableLanguages: ["en", "en_AU", "en_GB"],
+            preferredLanguages: ["fr-FR", "en-GB", "en-AU"]
+        ) == "en_GB")
+    }
+
+    @Test func spellingLanguageKeepsExplicitRegionalRequest() {
+        #expect(SpellingLanguage.resolve(
+            "en-GB",
+            availableLanguages: ["en", "en_GB"],
+            preferredLanguages: ["en-AU"]
+        ) == "en_GB")
+    }
+
+    @Test func spellingLanguageFallsBackConservatively() {
+        #expect(SpellingLanguage.resolve(
+            "en",
+            availableLanguages: ["en", "en_CA"],
+            preferredLanguages: ["en-US", "en-CA"]
+        ) == "en")
+        #expect(SpellingLanguage.resolve(
+            "fr",
+            availableLanguages: ["en"],
+            preferredLanguages: ["fr-CA"]
+        ) == nil)
+        #expect(SpellingLanguage.resolve(
+            nil,
+            availableLanguages: ["en_GB"],
+            preferredLanguages: ["en-GB"]
+        ) == nil)
+    }
+
+    @Test @MainActor func correctionSuffixWindowIgnoresLeadingPunctuation() {
+        #expect(CompletionController.correctionSuffixWindow(from: " , they are shown") == "")
+        #expect(CompletionController.correctionSuffixWindow(from: ", they are shown") == "")
+    }
+
+    @Test @MainActor func correctionSuffixWindowCapsNormalTextSuffix() {
+        #expect(CompletionController.correctionSuffixWindow(from: " are displayed, they are shown in the field") == " are displayed, they are shown ")
+    }
+
+    @Test @MainActor func systemGrammarDetectorUsesNSSpellCheckerCorrections() {
+        let context = TextFieldContext(
+            beforeCursor: "These popsicles is",
+            afterCursor: " delicious!",
+            target: Self.target,
+            detectedLanguage: "en"
+        )
+
+        let candidates = SystemGrammarCorrectionDetector().correctionCandidates(for: context)
+
+        #expect(candidates.contains {
+            $0.original == "is"
+                && $0.replacement == "are"
+                && $0.originalRange == TextRangeDescriptor(container: .beforeCursor, startOffset: 16, endOffset: 18)
+                && $0.source == .systemGrammarOnly
+        })
+    }
+
+    @Test @MainActor func systemGrammarDetectorDoesNotInventUnsupportedCorrections() {
+        let context = TextFieldContext(
+            beforeCursor: "The result is delicious",
+            afterCursor: ".",
+            target: Self.target,
+            detectedLanguage: "en"
+        )
+
+        #expect(SystemGrammarCorrectionDetector().correctionCandidates(for: context).isEmpty)
+    }
+
+    @Test @MainActor func spellingCandidateCanComposeThroughSystemGrammar() {
+        let context = TextFieldContext(
+            beforeCursor: "These popsiclse is",
+            afterCursor: " delicious!",
+            target: Self.target,
+            detectedLanguage: "en"
+        )
+        let spelling = CorrectionCandidate(
+            original: "popsiclse",
+            replacement: "popsicles",
+            originalRange: TextRangeDescriptor(container: .beforeCursor, startOffset: 6, endOffset: 15),
+            confidence: 0.9,
+            source: .spellcheckValidatedByModel,
+            validation: CorrectionValidation(method: .modelScore)
+        )
+
+        let candidates = SystemGrammarCorrectionDetector().candidates(afterApplying: spelling, in: context)
+
+        #expect(candidates.contains {
+            $0.original == "popsiclse is"
+                && $0.replacement == "popsicles are"
+                && $0.originalRange == TextRangeDescriptor(container: .beforeCursor, startOffset: 6, endOffset: 18)
+                && $0.source == .spellcheckThenSystemGrammar
+        })
+    }
+
+    @Test @MainActor func spellcheckDetectorKeepsTypoCorrectionsThatChangePriorText() async throws {
+        let displayContext = TextFieldContext(
+            beforeCursor: "The completion suggestions are not being displayd",
+            afterCursor: ".",
+            target: Self.target,
+            detectedLanguage: "en"
+        )
+        let suggestionsContext = TextFieldContext(
+            beforeCursor: "The completion suggestionss",
+            afterCursor: " are not being displayed.",
+            target: Self.target,
+            detectedLanguage: "en"
+        )
+        let detector = SystemSpellcheckCorrectionDetector()
+
+        let displayCandidates = try await detector.detectCorrection(for: displayContext)?.candidates ?? []
+        let suggestionCandidates = try await detector.detectCorrection(for: suggestionsContext)?.candidates ?? []
+
+        #expect(displayCandidates.contains { $0.original == "displayd" && $0.replacement == "displayed" })
+        #expect(suggestionCandidates.contains { $0.original == "suggestionss" && $0.replacement == "suggestions" })
+    }
+
+    @Test @MainActor func spellcheckDetectorSuppressesPrefixOnlyWordCompletion() async throws {
+        let context = TextFieldContext(
+            beforeCursor: "These popsicles are deliciou",
+            target: Self.target,
+            detectedLanguage: "en"
+        )
+
+        let detection = try await SystemSpellcheckCorrectionDetector().detectCorrection(for: context)
+
+        #expect(detection == nil)
+    }
+
+    @Test @MainActor func caretDebugOverlaySnapshotUsesCapturedFieldGeometry() {
+        let caret = CGRect(x: 42, y: 20, width: 2, height: 18)
+        let field = CGRect(x: 10, y: 10, width: 100, height: 36)
+        let context = TextFieldContext(
+            beforeCursor: "hello",
+            geometry: TextFieldGeometry(
+                cursorRect: caret,
+                fieldRect: field,
+                isRightToLeft: false
+            ),
+            target: Self.target
+        )
+        let snapshot = FocusedFieldSnapshot(
+            context: context,
+            caretRect: caret,
+            caretSource: "test",
+            caretQuality: "exact"
+        )
+
+        let overlaySnapshot = ContextCaptureController.debugOverlaySnapshot(for: snapshot)
+
+        #expect(overlaySnapshot?.caretRect == caret)
+        #expect(overlaySnapshot?.fieldRect == field)
+        #expect(overlaySnapshot?.availableTextRect == CGRect(x: 44, y: 20, width: 66, height: 18))
+    }
+
+    @Test @MainActor func missingSnapshotPreservesTunableTargetOnlyForKeyTypeFocus() {
+        #expect(ContextCaptureController.shouldPreserveLatestTunableSnapshotOnMissingSnapshot(
+            frontmostBundleIdentifier: "com.pattonium.KeyType.dev"
+        ))
+        #expect(!ContextCaptureController.shouldPreserveLatestTunableSnapshotOnMissingSnapshot(
+            frontmostBundleIdentifier: "com.apple.Pages"
+        ))
+        #expect(!ContextCaptureController.shouldPreserveLatestTunableSnapshotOnMissingSnapshot(
+            frontmostBundleIdentifier: nil
+        ))
+    }
+
+    @Test @MainActor func manualAppEntriesPersistWithPerAppDisable() {
+        let (defaults, suiteName) = Self.temporaryDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = SettingsStore(defaults: defaults)
+        store.addManualApp(bundleIdentifier: " com.example.MenuBar ", name: " MenuBar ")
+        store.setApp("com.example.MenuBar", enabled: false)
+
+        let reloaded = SettingsStore(defaults: defaults)
+
+        #expect(reloaded.manualPerAppDisplayNames["com.example.MenuBar"] == "MenuBar")
+        #expect(!reloaded.isAppEnabled("com.example.MenuBar"))
+    }
+
+    @Test @MainActor func inputMethodsDefaultOnAndPersistExplicitDisable() {
+        let (defaults, suiteName) = Self.temporaryDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let identifier = "com.chiboard.inputmethod.Chiboard"
+        let store = SettingsStore(defaults: defaults)
+        #expect(store.isInputMethodEnabled(identifier))
+
+        store.setInputMethod(identifier, enabled: false)
+        let reloaded = SettingsStore(defaults: defaults)
+
+        #expect(!reloaded.isInputMethodEnabled(identifier))
+        reloaded.setInputMethod(identifier, enabled: true)
+        #expect(SettingsStore(defaults: defaults).isInputMethodEnabled(identifier))
+    }
+
+    @Test @MainActor func selectedInputMethodControlsKeyTypeAvailability() {
+        let (defaults, suiteName) = Self.temporaryDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let abc = ActiveInputMethod(identifier: "com.apple.keylayout.ABC", name: "ABC")
+        let chiboard = ActiveInputMethod(
+            identifier: "com.chiboard.inputmethod.Chiboard",
+            name: "Chiboard"
+        )
+        let provider = TestActiveInputMethodProvider(
+            snapshot: ActiveInputMethodSnapshot(
+                inputMethods: [abc, chiboard],
+                selectedIdentifier: abc.identifier
+            )
+        )
+        let settings = SettingsStore(defaults: defaults)
+        let controller = InputMethodController(settings: settings, provider: provider)
+        var policyChangeCount = 0
+        controller.onSelectedInputMethodPolicyChange = { policyChangeCount += 1 }
+
+        #expect(controller.isKeyTypeEnabledForSelectedInputMethod)
+        controller.setEnabled(false, for: chiboard)
+        #expect(policyChangeCount == 0)
+
+        provider.currentSnapshot.selectedIdentifier = chiboard.identifier
+        controller.refresh()
+
+        #expect(!controller.isKeyTypeEnabledForSelectedInputMethod)
+        #expect(policyChangeCount == 1)
+
+        controller.setEnabled(true, for: chiboard)
+        #expect(controller.isKeyTypeEnabledForSelectedInputMethod)
+        #expect(policyChangeCount == 2)
+    }
+
+    @Test @MainActor func freshPrivacyDefaultsEnableHistoryAndClipboardOnly() {
+        let (defaults, suiteName) = Self.temporaryDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = SettingsStore(defaults: defaults)
+
+        #expect(store.historyEnabled)
+        #expect(store.clipboardEnabled)
+        #expect(!store.ocrEnabled)
+        #expect(!store.screenshotCalibrationEnabled)
+    }
+
+    @Test @MainActor func privacyDefaultsPreserveExplicitUserChoices() {
+        let (defaults, suiteName) = Self.temporaryDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = SettingsStore(defaults: defaults)
+        store.historyEnabled = false
+        store.clipboardEnabled = false
+
+        let reloaded = SettingsStore(defaults: defaults)
+
+        #expect(!reloaded.historyEnabled)
+        #expect(!reloaded.clipboardEnabled)
+    }
+
+    @Test @MainActor func promptCustomInstructionsAppendOSDerivedBritishEnglishAfterAppInstructions() {
+        let (defaults, suiteName) = Self.temporaryDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = SettingsStore(defaults: defaults)
+
+        let instructions = store.promptCustomInstructions(
+            appInstructions: ["Continue the current message only."],
+            systemLocaleIdentifier: "en_US",
+            preferredLanguages: ["en-GB"]
+        )
+
+        #expect(instructions.count == 2)
+        #expect(instructions[0] == "Continue the current message only.")
+        #expect(instructions[1].contains("British English"))
+    }
+
+    @Test func englishVariantUsesOnlyNonDefaultRegionalEnglishLocales() {
+        let british = EnglishVariant.promptInstruction(
+            systemLocaleIdentifier: "en_US",
+            preferredLanguages: ["en-GB"]
+        )
+        let american = EnglishVariant.promptInstruction(
+            systemLocaleIdentifier: "en_US",
+            preferredLanguages: ["en-US"]
+        )
+        let nonEnglish = EnglishVariant.promptInstruction(
+            systemLocaleIdentifier: "fr_FR",
+            preferredLanguages: ["fr-FR"]
+        )
+
+        #expect(british?.contains("British English") == true)
+        #expect(american == nil)
+        #expect(nonEnglish == nil)
+    }
+
+    @Test @MainActor func unassignedAcceptanceShortcutsPersist() {
+        let (defaults, suiteName) = Self.temporaryDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = SettingsStore(defaults: defaults)
+        store.acceptWordShortcut = .unassigned
+        store.acceptFullShortcut = AcceptanceShortcut(keyCode: 48, modifiers: [], label: "\u{21E5}")
+
+        let reloaded = SettingsStore(defaults: defaults)
+
+        #expect(reloaded.acceptWordShortcut == .unassigned)
+        #expect(!reloaded.acceptWordShortcut.matches(keyCode: 48, flags: CGEventFlags()))
+        #expect(reloaded.acceptFullShortcut.matches(keyCode: 48, flags: CGEventFlags()))
+    }
+
+    @Test @MainActor func developerPlacementProbeRequiresOptInAndUsableCaretGeometry() {
+        let (defaults, suiteName) = Self.temporaryDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = SettingsStore(defaults: defaults)
+        let controller = CompletionController(
+            tracker: AccessibilityContextTracker(),
+            settings: settings
+        )
+        let context = TextFieldContext(
+            beforeCursor: "Testing",
+            geometry: TextFieldGeometry(cursorRect: nil),
+            target: Self.target
+        )
+        let snapshot = FocusedFieldSnapshot(
+            context: context,
+            caretRect: nil,
+            caretSource: "test",
+            caretQuality: "missing"
+        )
+
+        #expect(!controller.showDeveloperPlacementProbe(using: snapshot))
+        settings.developerOverrideTuningEnabled = true
+        #expect(!controller.showDeveloperPlacementProbe(using: snapshot))
+        #expect(controller.visibleCandidate == nil)
+    }
+
+    @Test func developerTuningMissingSnapshotOnlyPreservesOverlayForKeyTypeItself() {
+        #expect(CompletionController.shouldPreserveDeveloperTuningOverlayForMissingSnapshot(
+            settingsEnabled: true,
+            hasVisibleCandidate: true,
+            developerTuningHold: true,
+            frontmostBundleIdentifier: "com.pattonium.KeyType.dev"
+        ))
+        #expect(!CompletionController.shouldPreserveDeveloperTuningOverlayForMissingSnapshot(
+            settingsEnabled: true,
+            hasVisibleCandidate: true,
+            developerTuningHold: true,
+            frontmostBundleIdentifier: "com.tencent.xinWeChat"
+        ))
+        #expect(!CompletionController.shouldPreserveDeveloperTuningOverlayForMissingSnapshot(
+            settingsEnabled: true,
+            hasVisibleCandidate: true,
+            developerTuningHold: false,
+            frontmostBundleIdentifier: "com.pattonium.KeyType.dev"
+        ))
+    }
+
+    @Test @MainActor func missingDeveloperPlacementProbeSnapshotClearsWithoutRendering() {
+        let (defaults, suiteName) = Self.temporaryDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = SettingsStore(defaults: defaults)
+        settings.developerOverrideTuningEnabled = true
+        let controller = CompletionController(
+            tracker: AccessibilityContextTracker(),
+            settings: settings
+        )
+
+        #expect(!controller.showDeveloperPlacementProbe(using: nil, text: " probe"))
+        #expect(controller.visibleCandidate == nil)
+    }
+
+    @Test func developerPlacementProbeShortcutRequiresCommandControlOptionGOnly() {
+        let flags: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate]
+
+        #expect(CompletionAcceptanceController.isDeveloperPlacementProbeShortcut(keyCode: 5, flags: flags))
+        #expect(!CompletionAcceptanceController.isDeveloperPlacementProbeShortcut(keyCode: 5, flags: flags.union(.maskShift)))
+        #expect(!CompletionAcceptanceController.isDeveloperPlacementProbeShortcut(keyCode: 6, flags: flags))
+        #expect(!CompletionAcceptanceController.isDeveloperPlacementProbeShortcut(keyCode: 5, flags: [.maskCommand, .maskControl]))
+    }
+
+    @Test func capsulePresentationIsUsedForVisibleCurrentLineSuffix() {
+        let context = TextFieldContext(
+            beforeCursor: "This is ",
+            afterCursor: "existing text",
+            geometry: TextFieldGeometry(isAtEndOfLine: false),
+            target: Self.target
+        )
+
+        #expect(CompletionController.shouldUseCapsule(for: context))
+    }
+
+    @Test func capsulePresentationTrustsEndOfLineGeometryOverStaleSuffix() {
+        let context = TextFieldContext(
+            beforeCursor: "Let's try",
+            afterCursor: "stale AX suffix",
+            geometry: TextFieldGeometry(isAtEndOfLine: true),
+            target: AppTarget(bundleIdentifier: "md.obsidian", appName: "Obsidian"),
+            traits: TextFieldTraits(isWebField: true)
+        )
+
+        #expect(!CompletionController.shouldUseCapsule(for: context))
+    }
+
+    @Test func obsidianIgnoresAXFontForOverlaySizing() {
+        let style = ResolvedFieldStyle(
+            font: NSFont.systemFont(ofSize: 48),
+            color: .labelColor
+        )
+        let context = TextFieldContext(
+            beforeCursor: "Notes are the core of Obsidian.",
+            target: AppTarget(bundleIdentifier: "md.obsidian", appName: "Obsidian"),
+            traits: TextFieldTraits(isWebField: true)
+        )
+
+        let effective = CompletionController.effectiveOverlayStyle(style, for: context)
+
+        #expect(effective.font == nil)
+        #expect(effective.color == .labelColor)
+    }
+
+    @Test func nonObsidianKeepsResolvedAXFont() {
+        let font = NSFont.systemFont(ofSize: 18)
+        let style = ResolvedFieldStyle(font: font, color: .labelColor)
+        let context = TextFieldContext(
+            beforeCursor: "This is a test",
+            target: Self.target
+        )
+
+        let effective = CompletionController.effectiveOverlayStyle(style, for: context)
+
+        #expect(effective.font?.pointSize == font.pointSize)
+        #expect(effective.font?.familyName == font.familyName)
+        #expect(effective.color == .labelColor)
+    }
+
+    @Test func missingAXFontCanUseCompatibilityMonospacedFallback() {
+        let style = ResolvedFieldStyle(color: .labelColor)
+        let context = TextFieldContext(
+            beforeCursor: "Android Studio editor alignment",
+            target: AppTarget(
+                bundleIdentifier: "com.google.android.studio",
+                appName: "Android Studio"
+            )
+        )
+        let fallback = OverlayFontFallback(
+            design: .monospaced,
+            sizeAdjustmentFactor: 0.87
+        )
+
+        let effective = CompletionController.effectiveOverlayStyle(
+            style,
+            for: context,
+            fontFallback: fallback
+        )
+        let expected = NSFont.monospacedSystemFont(
+            ofSize: NSFont.systemFontSize,
+            weight: .regular
+        )
+
+        #expect(effective.font?.familyName == expected.familyName)
+        #expect(effective.color == .labelColor)
+    }
+
+    @Test func compatibilityFontFallbackDoesNotReplaceResolvedAXFont() {
+        let font = NSFont.systemFont(ofSize: 17)
+        let style = ResolvedFieldStyle(font: font, color: .labelColor)
+        let context = TextFieldContext(
+            beforeCursor: "Android Studio editor alignment",
+            target: AppTarget(
+                bundleIdentifier: "com.google.android.studio",
+                appName: "Android Studio"
+            )
+        )
+
+        let effective = CompletionController.effectiveOverlayStyle(
+            style,
+            for: context,
+            fontFallback: OverlayFontFallback(
+                design: .monospaced,
+                sizeAdjustmentFactor: 0.87
+            )
+        )
+
+        #expect(effective.font?.fontName == font.fontName)
+        #expect(effective.font?.pointSize == font.pointSize)
+    }
+
+    @Test func screenshotCalibrationOffsetAppliesSignedOverlayCorrection() {
+        let font = NSFont.systemFont(ofSize: 16)
+        let style = ResolvedFieldStyle(font: font, lineHeight: 18)
+        let placement = OverlayPlacement(
+            cursorRect: CGRect(x: 20, y: 100, width: 2, height: 18),
+            fieldRect: CGRect(x: 10, y: 80, width: 240, height: 44)
+        )
+        let result = ScreenshotCalibrationResult(
+            detectedFontSize: 16,
+            bestSize: 17.6,
+            rmse: 0.1,
+            confidence: 0.9,
+            fontSizeAdjustmentFactor: 1.1,
+            verticalAlignmentOffset: -6,
+            actualLineLength: 12,
+            recognizedText: "hello world",
+            usesInvertedLuminance: false,
+            meetsQualityThresholds: true
+        )
+
+        let calibrated = CompletionController.applyOverlayCalibration(
+            result,
+            style: style,
+            placement: placement
+        )
+
+        #expect(calibrated.placement.cursorRect.minY == 94)
+        #expect(calibrated.style.font?.pointSize == 17.6)
+        #expect(calibrated.style.lineHeight == 19.8)
+        #expect(calibrated.style.usesFontPointSize)
+    }
+
+    @Test func capsulePresentationIsNotUsedAtEndOfLineForNewWordWrapping() {
+        let context = TextFieldContext(
+            beforeCursor: "This is a test ",
+            afterCursor: "",
+            target: Self.target
+        )
+
+        #expect(!CompletionController.shouldUseCapsule(for: context))
+    }
+
+    @Test func capsulePresentationIsNotUsedWhenSuffixStartsOnNextLine() {
+        let context = TextFieldContext(
+            beforeCursor: "This is a test ",
+            afterCursor: "\nnext paragraph",
+            target: Self.target
+        )
+
+        #expect(!CompletionController.shouldUseCapsule(for: context))
+    }
+
+    @Test func typeThroughAdvanceConsumesTypedPrefixBeforeAXSnapshot() {
+        let anchor = TextFieldContext(beforeCursor: "with a 20-core Media", target: Self.target)
+        let advanced = CompletionController.typeThroughAdvance(
+            anchorText: "Tek designed GPU, and a 10",
+            anchorContext: anchor,
+            liveContext: anchor,
+            typedCharacters: "T"
+        )
+
+        #expect(advanced?.context.beforeCursor == "with a 20-core MediaT")
+        #expect(advanced?.remainingText == "ek designed GPU, and a 10")
+    }
+
+    @Test func typeThroughAdvanceStacksWithoutWaitingForAXSnapshot() {
+        let anchor = TextFieldContext(beforeCursor: "with a 20-core Media", target: Self.target)
+        let first = CompletionController.typeThroughAdvance(
+            anchorText: "Tek designed GPU",
+            anchorContext: anchor,
+            liveContext: anchor,
+            typedCharacters: "T"
+        )
+        let second = first.flatMap {
+            CompletionController.typeThroughAdvance(
+                anchorText: "Tek designed GPU",
+                anchorContext: anchor,
+                liveContext: $0.context,
+                typedCharacters: "e"
+            )
+        }
+
+        #expect(second?.context.beforeCursor == "with a 20-core MediaTe")
+        #expect(second?.remainingText == "k designed GPU")
+    }
+
+    @Test func typeThroughAdvanceRejectsDivergentTypedText() {
+        let anchor = TextFieldContext(beforeCursor: "with a 20-core Media", target: Self.target)
+        let advanced = CompletionController.typeThroughAdvance(
+            anchorText: "Tek designed GPU",
+            anchorContext: anchor,
+            liveContext: anchor,
+            typedCharacters: "X"
+        )
+
+        #expect(advanced == nil)
+    }
+
+    @Test func promotionCachePromotesLowerRankedBranchWhenTopIsInvalidated() {
+        let cache = Self.promotionCache(candidates: [
+            "ship it today",
+            "review the patch",
+            "send the update"
+        ])
+
+        let decision = cache.decision(for: Self.liveContext(typed: "r"))
+
+        guard case let .promote(promotion) = decision else {
+            Issue.record("Expected lower-ranked branch promotion, got \(decision)")
+            return
+        }
+        #expect(promotion.sourceRank == 1)
+        #expect(promotion.anchorText == "review the patch")
+        #expect(promotion.remainingText == "eview the patch")
+    }
+
+    @Test func promotionCacheRecomputesWhenOnlyMatchesAreTooShort() {
+        let cache = Self.promotionCache(candidates: ["there"])
+
+        let decision = cache.decision(for: Self.liveContext(typed: "the"))
+
+        guard case .recompute(.matchingBranchesTooShort) = decision else {
+            Issue.record("Expected short-match recompute, got \(decision)")
+            return
+        }
+    }
+
+    @Test func promotionCacheRecomputesWhenNoBranchMatchesTypedText() {
+        let cache = Self.promotionCache(candidates: [
+            "ship it today",
+            "review the patch"
+        ])
+
+        let decision = cache.decision(for: Self.liveContext(typed: "z"))
+
+        guard case .recompute(.noMatch) = decision else {
+            Issue.record("Expected no-match recompute, got \(decision)")
+            return
+        }
+    }
+
+    @Test func promotionCacheRecomputesWhenContextChanged() {
+        let cache = Self.promotionCache(candidates: ["review the patch"])
+        let live = TextFieldContext(
+            beforeCursor: "I will r",
+            afterCursor: " later",
+            target: Self.target
+        )
+
+        let decision = cache.decision(for: live)
+
+        guard case .recompute(.contextChanged) = decision else {
+            Issue.record("Expected context-change recompute, got \(decision)")
+            return
+        }
+    }
+
+    @Test func promotionCacheAllowsSelectionRangeAndFieldMetadataRefreshDuringAppend() {
+        let cache = Self.promotionCache(candidates: ["review the patch"])
+        let live = TextFieldContext(
+            beforeCursor: "I will r",
+            selection: TextSelection(range: "I will r".endIndex..<"I will r".endIndex),
+            target: Self.target,
+            typingContext: "email-subject"
+        )
+
+        let decision = cache.decision(for: live)
+
+        guard case let .promote(promotion) = decision else {
+            Issue.record("Expected metadata refresh to keep append promotion, got \(decision)")
+            return
+        }
+        #expect(promotion.remainingText == "eview the patch")
+    }
+
+    @Test func promotionCacheRecomputesWhenSelectionIsActive() {
+        let cache = Self.promotionCache(candidates: ["review the patch"])
+        let live = TextFieldContext(
+            beforeCursor: "I will r",
+            selection: TextSelection(selectedText: "will"),
+            target: Self.target
+        )
+
+        let decision = cache.decision(for: live)
+
+        guard case .recompute(.contextChanged) = decision else {
+            Issue.record("Expected active-selection recompute, got \(decision)")
+            return
+        }
+    }
+
+    @Test func promotionCacheRecomputesWhenLiveCaretSwitchesFromCJKToLatinComposition() {
+        let cache = Self.promotionCache(candidates: ["z z z continuation"], beforeCursor: "我")
+        let live = TextFieldContext(beforeCursor: "我z", target: Self.target)
+
+        let decision = cache.decision(for: live)
+
+        guard case .recompute(.contextChanged) = decision else {
+            Issue.record("Expected script-change recompute, got \(decision)")
+            return
+        }
+    }
+
+    @Test func heldAnchorCanKeepShortRemainderThatPromotionCacheWouldReject() {
+        let anchor = TextFieldContext(beforeCursor: "I will ", target: Self.target)
+        let liveAfterFirstAcceptedWord = TextFieldContext(beforeCursor: "I will say ", target: Self.target)
+        let cache = CompletionPromotionCache(
+            anchorContext: anchor,
+            entries: [
+                CompletionPromotionCache.Entry(anchorText: "say hi", sourceRank: 0)
+            ]
+        )
+
+        guard case .recompute(.matchingBranchesTooShort) = cache.decision(for: liveAfterFirstAcceptedWord) else {
+            Issue.record("Expected cache to reject the short remaining branch")
+            return
+        }
+        #expect(
+            SuggestionAnchor.remaining(
+                anchorText: "say hi",
+                anchor: anchor,
+                live: liveAfterFirstAcceptedWord
+            ) == "hi"
+        )
+    }
+
+    @Test func heldAnchorCanKeepLongRemainderWhenPromotionCacheRejectedByActiveSelection() {
+        let anchor = TextFieldContext(beforeCursor: "I will ", target: Self.target)
+        let liveAfterFirstAcceptedWord = TextFieldContext(
+            beforeCursor: "I will review ",
+            selection: TextSelection(selectedText: "selected"),
+            target: Self.target
+        )
+        let cache = CompletionPromotionCache(
+            anchorContext: anchor,
+            entries: [
+                CompletionPromotionCache.Entry(anchorText: "review the patch tomorrow", sourceRank: 0)
+            ]
+        )
+
+        guard case .recompute(.contextChanged) = cache.decision(for: liveAfterFirstAcceptedWord) else {
+            Issue.record("Expected cache to reject the active-selection branch")
+            return
+        }
+        #expect(
+            SuggestionAnchor.remaining(
+                anchorText: "review the patch tomorrow",
+                anchor: anchor,
+                live: liveAfterFirstAcceptedWord
+            ) == "the patch tomorrow"
+        )
+    }
+
+    @Test func promotionCacheQuantifiesAvoidedRegenerationCoverage() {
+        let branches = [
+            "alpha release",
+            "bravo release",
+            "charlie release",
+            "delta release",
+            "echo release"
+        ]
+        let typedChoices = ["a", "b", "c", "d", "e", "z"]
+        let cache = Self.promotionCache(candidates: branches)
+
+        let cacheReusable = typedChoices.filter { typed in
+            if case .promote = cache.decision(for: Self.liveContext(typed: typed)) {
+                return true
+            }
+            return false
+        }.count
+        let topOnlyReusable = typedChoices.filter { typed in
+            guard branches[0].hasPrefix(typed) else { return false }
+            return branches[0].dropFirst(typed.count).count >= CompletionPromotionCache.defaultMinimumRemainingCharacters
+        }.count
+
+        #expect(topOnlyReusable == 1)
+        #expect(cacheReusable == 5)
+        #expect(typedChoices.count - topOnlyReusable == 5)
+        #expect(typedChoices.count - cacheReusable == 1)
+    }
+
+    @Test func reuseHistoryUsesOneHundredFiftyEntriesByDefaultWithTenPercentKindBudgets() {
+        let history = CompletionReuseHistory()
+
+        #expect(history.maxEntries == 150)
+        #expect(history.minimumEntriesPerKind == 15)
+    }
+
+    @Test func reuseHistoryPromotesAppendBranchFromRecentSnapshot() {
+        var history = CompletionReuseHistory()
+        history.record(Self.promotionCache(candidates: [
+            "ship it today",
+            "review the patch",
+            "send the update"
+        ]))
+
+        let decision = history.decision(for: Self.liveContext(typed: "r"), preferredKind: .append)
+
+        guard case let .reuse(reuse) = decision else {
+            Issue.record("Expected append reuse, got \(decision)")
+            return
+        }
+        #expect(reuse.kind == .append)
+        #expect(reuse.sourceRank == 1)
+        #expect(reuse.anchorText == "eview the patch")
+        #expect(reuse.remainingText == "eview the patch")
+        #expect(reuse.anchorContext.beforeCursor == "I will r")
+    }
+
+    @Test func reuseHistoryRecoversRollbackAnchorAfterDeletingTypoStem() {
+        var history = CompletionReuseHistory()
+        history.record(
+            Self.promotionCache(
+                candidates: ["ew the patch"],
+                beforeCursor: "I will revi"
+            )
+        )
+
+        let liveAfterDelete = TextFieldContext(beforeCursor: "I will rev", target: Self.target)
+        let decision = history.decision(for: liveAfterDelete, preferredKind: .rollback)
+
+        guard case let .reuse(reuse) = decision else {
+            Issue.record("Expected rollback reuse, got \(decision)")
+            return
+        }
+        #expect(reuse.kind == .rollback)
+        #expect(reuse.anchorText == "iew the patch")
+        #expect(reuse.remainingText == "iew the patch")
+        #expect(reuse.anchorContext.beforeCursor == "I will rev")
+    }
+
+    @Test func reuseHistoryFallsBackToAppendAfterDeleteBackwardWhenRollbackMisses() {
+        var history = CompletionReuseHistory()
+        history.record(
+            Self.promotionCache(
+                candidates: ["encent is about to launch their T1"],
+                beforeCursor: "T"
+            )
+        )
+
+        let liveAfterDelete = TextFieldContext(
+            beforeCursor: "Tencent is about to launc",
+            target: Self.target
+        )
+        guard case .miss(kind: .rollback, reason: .noMatch) =
+                history.decision(for: liveAfterDelete, preferredKind: .rollback)
+        else {
+            Issue.record("Expected rollback alone to miss")
+            return
+        }
+
+        let decision = history.decisionAfterDeleteBackward(for: liveAfterDelete)
+
+        guard case let .reuse(reuse) = decision else {
+            Issue.record("Expected delete-backward append fallback reuse, got \(decision)")
+            return
+        }
+        #expect(reuse.kind == .append)
+        #expect(reuse.sourceRank == 0)
+        #expect(reuse.remainingText == "h their T1")
+        #expect(reuse.anchorContext.beforeCursor == "Tencent is about to launc")
+    }
+
+    @Test func reuseHistoryRecomputesRollbackWhenOnlyMatchesAreTooShort() {
+        var history = CompletionReuseHistory()
+        history.record(
+            Self.promotionCache(
+                candidates: ["k"],
+                beforeCursor: "I will ta"
+            )
+        )
+
+        let liveAfterDelete = TextFieldContext(beforeCursor: "I will t", target: Self.target)
+        let decision = history.decision(for: liveAfterDelete, preferredKind: .rollback)
+
+        guard case .miss(kind: .rollback, reason: .matchingBranchesTooShort) = decision else {
+            Issue.record("Expected short rollback miss, got \(decision)")
+            return
+        }
+    }
+
+    @Test func reuseHistoryQuantifiesRollbackAvoidedRegenerationCoverage() {
+        let branches = [
+            ("I will revi", "ew the patch"),
+            ("Please sen", "d the update"),
+            ("We can shi", "p it today"),
+            ("Let's documen", "t the decision"),
+            ("The model predi", "cts the suffix")
+        ]
+        var history = CompletionReuseHistory()
+        for (beforeCursor, completion) in branches {
+            history.record(Self.promotionCache(candidates: [completion], beforeCursor: beforeCursor))
+        }
+
+        let historyReusable = branches.filter { beforeCursor, _ in
+            let liveAfterDelete = TextFieldContext(
+                beforeCursor: String(beforeCursor.dropLast()),
+                target: Self.target
+            )
+            if case .reuse = history.decision(for: liveAfterDelete, preferredKind: .rollback) {
+                return true
+            }
+            return false
+        }.count
+        let flushedSingleCacheReusable = 0
+
+        #expect(flushedSingleCacheReusable == 0)
+        #expect(historyReusable == 5)
+        #expect(branches.count - flushedSingleCacheReusable == 5)
+        #expect(branches.count - historyReusable == 0)
+    }
+
+    @Test func reuseHistoryEvictsOldestEntriesAtCapacity() {
+        var history = CompletionReuseHistory(maxEntries: 150)
+        for index in 0..<40 {
+            history.record(
+                Self.promotionCache(
+                    candidates: Self.candidateTexts(prefix: "snapshot \(index)", count: 5),
+                    beforeCursor: "Prompt \(index) "
+                )
+            )
+        }
+
+        #expect(history.entryCount == 150)
+        #expect(history.appendEntryCount == 5)
+        #expect(history.rollbackEntryCount == 145)
+
+        let oldestLive = TextFieldContext(beforeCursor: "Prompt 0 ", target: Self.target)
+        guard case .miss(kind: _, reason: .noMatch) = history.decision(for: oldestLive, preferredKind: .rollback) else {
+            Issue.record("Expected oldest snapshot to be evicted")
+            return
+        }
+
+        let newestLive = TextFieldContext(beforeCursor: "Prompt 39 ", target: Self.target)
+        guard case .reuse = history.decision(for: newestLive, preferredKind: .rollback) else {
+            Issue.record("Expected newest snapshot to remain reusable")
+            return
+        }
+    }
+
+    @Test func reuseHistoryPreservesTenPercentBudgetForCurrentAndRollbackEntries() {
+        var history = CompletionReuseHistory(maxEntries: 150)
+        history.record(
+            Self.promotionCache(
+                candidates: Self.candidateTexts(prefix: "rollback", count: 20),
+                beforeCursor: "Older "
+            )
+        )
+        history.record(
+            Self.promotionCache(
+                candidates: Self.candidateTexts(prefix: "current", count: 140),
+                beforeCursor: "Current "
+            )
+        )
+
+        #expect(history.entryCount == 150)
+        #expect(history.minimumEntriesPerKind == 15)
+        #expect(history.rollbackEntryCount == 15)
+        #expect(history.appendEntryCount == 135)
+    }
+}
+
+@MainActor
+private final class TestActiveInputMethodProvider: ActiveInputMethodProviding {
+    var currentSnapshot: ActiveInputMethodSnapshot
+
+    init(snapshot: ActiveInputMethodSnapshot) {
+        self.currentSnapshot = snapshot
+    }
+
+    func snapshot() -> ActiveInputMethodSnapshot {
+        currentSnapshot
+    }
+}
